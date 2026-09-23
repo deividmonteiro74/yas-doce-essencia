@@ -70,13 +70,24 @@ const SUPABASE_URL="https://bnflgiotzyaglwmarbzg.supabase.co";
 const SUPABASE_ANON_KEY="sb_publishable_7uhyqDXpsq5dGQc2S0Fwpw_nWocBYku";
 const sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
 let D=load(); let route='dashboard'; let filter={from:firstDay(),to:isoToday(),product:'all',payment:'all'};
-let cloudReady=false,syncing=false,pendingSync=false,screenMode='login',lastUpdatedAt=null;
+let cloudReady=false,syncing=false,pendingSync=false,screenMode='login',lastUpdatedAt=null,cloudHydrated=false,bootRetryTimer=null;
 function firstDay(){let d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01`}
 function load(){try{let d=Object.assign(structuredClone(defaultData),JSON.parse(localStorage.getItem('yas_v4')||'{}'));d.dailyStock=Array.isArray(d.dailyStock)?d.dailyStock:[];d.stockClosings=Array.isArray(d.stockClosings)?d.stockClosings:[];return d}catch(e){return structuredClone(defaultData)}}
 function save(){localStorage.setItem('yas_v4',JSON.stringify(D));document.body.classList.toggle('dark',!!D.dark);syncCloud()}
 function syncCloud(){if(syncing){pendingSync=true;return}pushCloud()}
-async function pushCloud(){syncing=true;let dot=document.getElementById('connDot');if(dot)dot.style.background='#60a5fa';let ts=new Date().toISOString();try{let payload=Object.assign({},D,{orders:[]});await sb.from('app_state').upsert({id:'main',data:payload,updated_at:ts});lastUpdatedAt=ts;setConnStatus(true)}catch(e){setConnStatus(false)}finally{syncing=false;if(pendingSync){pendingSync=false;pushCloud()}}}
-function setConnStatus(ok){cloudReady=ok;let el=document.getElementById('connDot');if(el){el.title=ok?'Sincronizado com a nuvem':'Sem conexão — salvo só neste aparelho';el.style.background=ok?'#22c55e':'#f59e0b'}}
+async function pushCloud(){
+  if(!cloudHydrated){
+    // Trava de segurança: nunca gravar o documento compartilhado (produtos,
+    // config, despesas...) antes de termos confirmado que já lemos os dados
+    // reais da nuvem nesta sessão. Sem isso, um aparelho que abre o site pela
+    // primeira vez (ou com falha de rede momentânea) pode acabar enviando o
+    // catálogo padrão de fábrica por cima dos seus dados reais.
+    setConnStatus(false);
+    return;
+  }
+  syncing=true;let dot=document.getElementById('connDot');if(dot)dot.style.background='#60a5fa';let ts=new Date().toISOString();try{let payload=Object.assign({},D,{orders:[]});await sb.from('app_state').upsert({id:'main',data:payload,updated_at:ts});lastUpdatedAt=ts;setConnStatus(true)}catch(e){setConnStatus(false)}finally{syncing=false;if(pendingSync){pendingSync=false;pushCloud()}}
+}
+function setConnStatus(ok){cloudReady=ok;let el=document.getElementById('connDot');if(el){el.title=ok?'Sincronizado com a nuvem':(cloudHydrated?'Sem conexão — salvo só neste aparelho':'Conectando… ainda não é seguro salvar');el.style.background=ok?'#22c55e':'#f59e0b'}}
 // --- Pedidos: cada um é sua própria linha na tabela "orders", não fica
 // dentro do documento único. Isso evita que uma aba desatualizada
 // "ressuscite" um pedido que já foi excluído em outro lugar.
@@ -86,8 +97,7 @@ function orderPersistDelete(id){sb.from('orders').delete().eq('id',id).then(({er
 function ordersPersistDeleteAll(){sb.from('orders').delete().gte('created_at','1970-01-01T00:00:00Z').then(()=>{})}
 async function ordersPersistResyncImported(list){try{await sb.from('orders').delete().eq('data->>source','import');if(list.length)await sb.from('orders').insert(list.map(o=>({id:o.id,data:o})))}catch(e){}}
 async function ordersLoadAll(){try{const {data,error}=await sb.from('orders').select('data').order('created_at',{ascending:true});if(error)return null;return (data||[]).map(r=>r.data)}catch(e){return null}}
-async function boot(){
-  app.innerHTML=`<div class="boot"><div class="boot-mark"><img src="${LOGO_SRC}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div><p>Carregando…</p></div>`;
+async function hydrateFromCloud(){
   try{
     const {data,error}=await sb.from('app_state').select('data,updated_at').eq('id','main').single();
     if(!error&&data&&data.data){
@@ -95,17 +105,35 @@ async function boot(){
       d.dailyStock=Array.isArray(d.dailyStock)?d.dailyStock:[];
       d.stockClosings=Array.isArray(d.stockClosings)?d.stockClosings:[];
       d.orders=D.orders; // pedidos vêm da tabela própria, não deste documento
-      D=d;localStorage.setItem('yas_v4',JSON.stringify(D));cloudReady=true;lastUpdatedAt=data.updated_at;
-    }else if(error){setConnStatus(false)}
-  }catch(e){setConnStatus(false)}
-  let orderRows=await ordersLoadAll();
-  if(orderRows){D.orders=orderRows;localStorage.setItem('yas_v4',JSON.stringify(D))}
+      D=d;localStorage.setItem('yas_v4',JSON.stringify(D));lastUpdatedAt=data.updated_at;
+      cloudHydrated=true;setConnStatus(true);
+      let orderRows=await ordersLoadAll();
+      if(orderRows){D.orders=orderRows;localStorage.setItem('yas_v4',JSON.stringify(D))}
+      return true;
+    }
+  }catch(e){}
+  setConnStatus(false);
+  return false;
+}
+async function boot(){
+  app.innerHTML=`<div class="boot"><div class="boot-mark"><img src="${LOGO_SRC}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div><p>Carregando…</p></div>`;
+  await hydrateFromCloud();
   if(new URLSearchParams(location.search).get('cliente')==='1')customerOpen(false);
   else if(sessionStorage.getItem('yas_admin'))adminView();
   else loginView();
   watchCloud();watchOrders();
   setInterval(pollCloud,5000);setInterval(refreshOrders,5000);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollCloud();refreshOrders()}});
+  if(!cloudHydrated)retryHydrate();
+}
+function retryHydrate(){
+  clearTimeout(bootRetryTimer);
+  bootRetryTimer=setTimeout(async()=>{
+    if(cloudHydrated)return;
+    let ok=await hydrateFromCloud();
+    if(ok){if(screenMode==='admin')go(route);else if(screenMode==='login')loginView()}
+    else retryHydrate();
+  },4000);
 }
 function applyIncoming(incoming,updatedAt){
   if(document.getElementById('modalLayer')?.children.length)return; // não interromper algo que o admin está preenchendo
@@ -114,6 +142,7 @@ function applyIncoming(incoming,updatedAt){
   d.stockClosings=Array.isArray(d.stockClosings)?d.stockClosings:[];
   d.orders=D.orders; // pedidos são tratados à parte, por refreshOrders()
   D=d;localStorage.setItem('yas_v4',JSON.stringify(D));if(updatedAt)lastUpdatedAt=updatedAt;
+  cloudHydrated=true;
   if(screenMode==='admin')go(route);
 }
 function watchCloud(){
@@ -142,6 +171,7 @@ async function refreshOrders(){
 }
 async function pollCloud(){
   if(document.hidden)return;
+  if(!cloudHydrated)return hydrateFromCloud();
   try{
     const {data,error}=await sb.from('app_state').select('data,updated_at').eq('id','main').single();
     if(error||!data)return setConnStatus(false);
